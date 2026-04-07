@@ -2,14 +2,17 @@
 RunPod Serverless handler for Flux Kontext Dev image generation.
 Pipeline loaded once at startup, kept in GPU memory.
 Supports text-to-image and reference-based (character consistency) generation.
+Strength parameter controls reference image influence on composition.
 """
 
 import base64
 import io
+import math
 import os
 import time
 from typing import Any
 
+import numpy as np
 import runpod
 import torch
 from PIL import Image
@@ -20,7 +23,7 @@ MODELS_ROOT = os.environ.get("MODELS_ROOT", "/runpod-volume/ComfyUI/models")
 MODEL_PATH = os.environ.get("MODEL_PATH", os.path.join(MODELS_ROOT, "flux-kontext-dev"))
 USE_FP8 = os.environ.get("USE_FP8", "true").lower() == "true"
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
-WORKER_VERSION = "flux-kontext-v1"
+WORKER_VERSION = "flux-kontext-v2"
 
 # ── Load Pipeline Once ──────────────────────────────────────
 
@@ -81,6 +84,43 @@ def encode_output_image(image: Image.Image, fmt: str = "PNG") -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+def calculate_shift(image_seq_len, base_seq_len=256, max_seq_len=4096, base_shift=0.5, max_shift=1.15):
+    """Compute mu for dynamic shifting based on latent sequence length."""
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    return image_seq_len * m + b
+
+
+def build_strength_sigmas(num_steps, strength, height, width):
+    """
+    Build truncated sigma schedule for img2img strength control.
+    Lower strength = fewer steps = less reference image influence on composition.
+    Returns (sigmas_list, mu) for passing to the pipeline.
+    """
+    # Compute latent sequence length (after VAE 8x downscale + 2x2 packing)
+    image_seq_len = (height // 16) * (width // 16)
+
+    # Compute mu for dynamic shifting
+    scheduler_config = PIPELINE.scheduler.config
+    mu = calculate_shift(
+        image_seq_len,
+        scheduler_config.get("base_image_seq_len", 256),
+        scheduler_config.get("max_image_seq_len", 4096),
+        scheduler_config.get("base_shift", 0.5),
+        scheduler_config.get("max_shift", 1.15),
+    )
+
+    # Build unshifted sigmas (the scheduler will apply dynamic shift)
+    full_sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
+
+    # Truncate: skip early steps to reduce reference influence
+    start_idx = int(round(num_steps * (1.0 - strength)))
+    start_idx = max(0, min(start_idx, num_steps - 1))
+    truncated = full_sigmas[start_idx:]
+
+    return truncated.tolist(), mu
+
+
 # ── Handler ─────────────────────────────────────────────────
 
 @torch.inference_mode()
@@ -113,10 +153,9 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:
             return {"error": f"Failed to decode input image: {exc}"}
 
-    # Strength parameter: controls how much the reference image influences output
-    # 1.0 = full denoise (ignore reference composition), 0.0 = keep reference exactly
-    # Default 0.88 for normal i2i. Use 0.4-0.6 for wide scenes with character refs.
-    strength = float(job_input.get("strength", 0.88))
+    # Strength: 1.0 = full creative freedom, 0.0 = keep reference exactly
+    # Default 1.0 (no truncation). Use 0.4-0.6 for wide scenes with character refs.
+    strength = float(job_input.get("strength", 1.0))
     strength = max(0.01, min(1.0, strength))
 
     mode = "i2i" if input_image else "t2i"
@@ -126,20 +165,14 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     try:
         generator = torch.Generator("cuda").manual_seed(seed)
 
-        # Build custom sigmas for strength control (skip early steps to reduce ref influence)
+        # Build call kwargs — add strength control for i2i
         call_kwargs = {}
-        if input_image and strength < 0.85:
-            # Generate full sigma schedule, then skip early steps
-            from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-            scheduler = PIPELINE.scheduler
-            scheduler.set_timesteps(num_steps)
-            full_sigmas = scheduler.sigmas
-            # Skip the first (1 - strength) fraction of steps
-            start_step = int(round((1.0 - strength) * num_steps))
-            truncated_sigmas = full_sigmas[start_step:]
-            call_kwargs["sigmas"] = truncated_sigmas.tolist()
-            actual_steps = len(truncated_sigmas) - 1
-            print(f"  Strength {strength}: skipping {start_step}/{num_steps} steps, running {actual_steps} steps")
+        if input_image and strength < 0.95:
+            sigmas, mu = build_strength_sigmas(num_steps, strength, height, width)
+            call_kwargs["sigmas"] = sigmas
+            call_kwargs["mu"] = mu
+            actual_steps = len(sigmas)
+            print(f"  Strength {strength}: running {actual_steps}/{num_steps} steps (mu={mu:.3f})")
 
         result = PIPELINE(
             image=input_image,

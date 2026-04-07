@@ -113,12 +113,33 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:
             return {"error": f"Failed to decode input image: {exc}"}
 
+    # Strength parameter: controls how much the reference image influences output
+    # 1.0 = full denoise (ignore reference composition), 0.0 = keep reference exactly
+    # Default 0.88 for normal i2i. Use 0.4-0.6 for wide scenes with character refs.
+    strength = float(job_input.get("strength", 0.88))
+    strength = max(0.01, min(1.0, strength))
+
     mode = "i2i" if input_image else "t2i"
-    print(f"Generating {mode}: {width}x{height}, seed={seed}, guidance={guidance_scale}, steps={num_steps}")
+    print(f"Generating {mode}: {width}x{height}, seed={seed}, guidance={guidance_scale}, steps={num_steps}, strength={strength}")
     gen_start = time.time()
 
     try:
         generator = torch.Generator("cuda").manual_seed(seed)
+
+        # Build custom sigmas for strength control (skip early steps to reduce ref influence)
+        call_kwargs = {}
+        if input_image and strength < 0.85:
+            # Generate full sigma schedule, then skip early steps
+            from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+            scheduler = PIPELINE.scheduler
+            scheduler.set_timesteps(num_steps)
+            full_sigmas = scheduler.sigmas
+            # Skip the first (1 - strength) fraction of steps
+            start_step = int(round((1.0 - strength) * num_steps))
+            truncated_sigmas = full_sigmas[start_step:]
+            call_kwargs["sigmas"] = truncated_sigmas.tolist()
+            actual_steps = len(truncated_sigmas) - 1
+            print(f"  Strength {strength}: skipping {start_step}/{num_steps} steps, running {actual_steps} steps")
 
         result = PIPELINE(
             image=input_image,
@@ -128,6 +149,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             height=height,
             width=width,
             generator=generator,
+            **call_kwargs,
         )
 
         output_image = result.images[0]

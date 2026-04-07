@@ -165,25 +165,33 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     try:
         generator = torch.Generator("cuda").manual_seed(seed)
 
-        # Build call kwargs — add strength control for i2i
-        call_kwargs = {}
+        # Strength control: set timesteps on scheduler manually, then pass sigmas
         if input_image and strength < 0.95:
             sigmas, mu = build_strength_sigmas(num_steps, strength, height, width)
-            call_kwargs["sigmas"] = sigmas
-            call_kwargs["mu"] = mu
+            # Set timesteps with mu on the scheduler directly
+            PIPELINE.scheduler.set_timesteps(sigmas=sigmas, device="cuda", mu=mu)
             actual_steps = len(sigmas)
             print(f"  Strength {strength}: running {actual_steps}/{num_steps} steps (mu={mu:.3f})")
 
-        result = PIPELINE(
-            image=input_image,
-            prompt=prompt,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_steps,
-            height=height,
-            width=width,
-            generator=generator,
-            **call_kwargs,
-        )
+            result = PIPELINE(
+                image=input_image,
+                prompt=prompt,
+                guidance_scale=guidance_scale,
+                sigmas=sigmas,
+                height=height,
+                width=width,
+                generator=generator,
+            )
+        else:
+            result = PIPELINE(
+                image=input_image,
+                prompt=prompt,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_steps,
+                height=height,
+                width=width,
+                generator=generator,
+            )
 
         output_image = result.images[0]
         image_base64 = encode_output_image(output_image, output_format)

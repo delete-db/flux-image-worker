@@ -128,6 +128,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             height=height,
             width=width,
             generator=generator,
+            max_sequence_length=512,
         )
 
         output_image = result.images[0]
